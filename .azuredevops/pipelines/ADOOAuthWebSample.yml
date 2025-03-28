@@ -1,0 +1,43 @@
+trigger: none
+
+pool:
+  vmImage: 'windows-latest'
+
+variables:
+- name: solution
+  value: '$(System.DefaultWorkingDirectory)\OAuthWebSample\OAuthWebSample.sln'
+- name: buildPlatform
+  value: 'Any CPU'
+- name: buildConfiguration
+  value: 'Release'
+- group: VG-ADOOAuthWebSample
+
+steps:
+- task: NuGetToolInstaller@1
+  inputs:
+    versionSpec: 
+    checkLatest: true
+- task: NuGetCommand@2
+  inputs:
+    restoreSolution: '$(solution)'
+- task: VSBuild@1
+  inputs:
+    solution: '$(solution)'
+    msbuildArgs: '/p:DeployOnBuild=true /p:WebPublishMethod=Package /p:PackageAsSingleFile=true /p:SkipInvalidConfigurations=true /p:DesktopBuildPackageLocation="$(build.artifactStagingDirectory)\WebApp.zip" /p:DeployIisAppPath="Default Web Site"'
+    platform: '$(buildPlatform)'
+    configuration: '$(buildConfiguration)'
+# - task: VSTest@2
+#   inputs:
+#     platform: '$(buildPlatform)'
+#     configuration: '$(buildConfiguration)'
+- task: AzureRmWebAppDeployment@5
+  inputs:
+    ConnectionType: 'AzureRM'
+    azureSubscription: '$(ARMSvcCnn)'
+    appType: 'webApp'
+    WebAppName: '$(WebAppName)'
+    packageForLinux: '$(build.artifactStagingDirectory)\WebApp.zip'
+    AppSettings: >
+      -ClientAppId $(ClientAppId)
+      -ClientAppSecret $(ClientAppSecret)
+      -CallbackUrl $(CallbackUrl)
