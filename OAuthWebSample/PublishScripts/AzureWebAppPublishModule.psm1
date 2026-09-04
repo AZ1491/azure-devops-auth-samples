@@ -1382,6 +1382,7 @@ function Get-MSDeployCmd
 {
     Write-VerboseWithTime 'Get-MSDeployCmd: Start'
     $regKey = 'HKLM:\SOFTWARE\Microsoft\IIS Extensions\MSDeploy'
+    $msdeployPath = $null
 
     if (!(Test-Path $regKey))
     {
@@ -1405,7 +1406,9 @@ function Get-MSDeployCmd
 
                 if (Test-Path $installPath -PathType Leaf)
                 {
-                    $msdeployPath = $installPath
+                    $resolvedPath = Resolve-MSDeployExecutablePath $installPath
+                    Test-MSDeployExecutableTrust -ResolvedPath $resolvedPath | Out-Null
+                    $msdeployPath = $resolvedPath
                     break
                 }
             }
@@ -1414,6 +1417,196 @@ function Get-MSDeployCmd
 
     Write-VerboseWithTime 'Get-MSDeployCmd: End'
     return $msdeployPath
+}
+
+function Resolve-MSDeployExecutablePath
+{
+    param
+    (
+        [Parameter(Mandatory = $true)]
+        [String]
+        $Path
+    )
+
+    if (!('AzureWebAppPublishModule.NativePath' -as [Type]))
+    {
+        Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+using System.Text;
+using Microsoft.Win32.SafeHandles;
+
+namespace AzureWebAppPublishModule
+{
+    public static class NativePath
+    {
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        public static extern uint GetFinalPathNameByHandle(
+            SafeFileHandle handle,
+            StringBuilder path,
+            uint pathLength,
+            uint flags);
+    }
+}
+'@
+    }
+
+    $stream = [IO.File]::Open(
+        $Path,
+        [IO.FileMode]::Open,
+        [IO.FileAccess]::Read,
+        [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete)
+
+    try
+    {
+        $buffer = New-Object Text.StringBuilder 32768
+        $length = [AzureWebAppPublishModule.NativePath]::GetFinalPathNameByHandle(
+            $stream.SafeFileHandle,
+            $buffer,
+            [uint32]$buffer.Capacity,
+            0)
+
+        if ($length -eq 0 -or $length -ge $buffer.Capacity)
+        {
+            throw 'Get-MSDeployCmd: Can not resolve the final MsDeploy.exe path.'
+        }
+
+        $resolvedPath = $buffer.ToString()
+        if ($resolvedPath.StartsWith('\\?\UNC\', [StringComparison]::OrdinalIgnoreCase))
+        {
+            $resolvedPath = '\\' + $resolvedPath.Substring(8)
+        }
+        elseif ($resolvedPath.StartsWith('\\?\', [StringComparison]::OrdinalIgnoreCase))
+        {
+            $resolvedPath = $resolvedPath.Substring(4)
+        }
+
+        return [IO.Path]::GetFullPath($resolvedPath)
+    }
+    finally
+    {
+        $stream.Dispose()
+    }
+}
+
+function Test-MSDeployExecutableTrust
+{
+    param
+    (
+        [Parameter(Mandatory = $true)]
+        [String]
+        $ResolvedPath,
+
+        [Parameter(Mandatory = $false)]
+        [String[]]
+        $ApprovedRoots = @(
+            [Environment]::GetFolderPath('ProgramFiles')
+            [Environment]::GetFolderPath('ProgramFilesX86')
+        )
+    )
+
+    $isApprovedPath = $ApprovedRoots |
+        Where-Object { $_ } |
+        Where-Object {
+            $ResolvedPath.StartsWith(
+                $_.TrimEnd('\', '/') + [IO.Path]::DirectorySeparatorChar,
+                [StringComparison]::OrdinalIgnoreCase)
+        }
+    $signature = Get-AuthenticodeSignature $ResolvedPath
+    $organizationValues = Get-X500OrganizationValues $signature.SignerCertificate.Subject
+    $hasMicrosoftOrganization = $organizationValues -ccontains 'Microsoft Corporation'
+
+    if (!$isApprovedPath -or
+        $signature.Status -ne [System.Management.Automation.SignatureStatus]::Valid -or
+        !$hasMicrosoftOrganization)
+    {
+        throw 'Get-MSDeployCmd: MsDeploy.exe is outside an approved installation path or is not signed by Microsoft.'
+    }
+
+    return $true
+}
+
+function Get-X500OrganizationValues
+{
+    param
+    (
+        [Parameter(Mandatory = $false)]
+        [AllowNull()]
+        [String]
+        $Subject
+    )
+
+    if (!$Subject)
+    {
+        return @()
+    }
+
+    $components = @()
+    $component = New-Object Text.StringBuilder
+    $escaped = $false
+    $quoted = $false
+
+    foreach ($character in $Subject.ToCharArray())
+    {
+        if ($escaped)
+        {
+            [void]$component.Append($character)
+            $escaped = $false
+            continue
+        }
+
+        if ($character -eq '\')
+        {
+            [void]$component.Append($character)
+            $escaped = $true
+            continue
+        }
+
+        if ($character -eq '"')
+        {
+            [void]$component.Append($character)
+            $quoted = !$quoted
+            continue
+        }
+
+        if (!$quoted -and ($character -eq ',' -or $character -eq '+'))
+        {
+            $components += $component.ToString()
+            [void]$component.Clear()
+            continue
+        }
+
+        [void]$component.Append($character)
+    }
+
+    $components += $component.ToString()
+    return @($components | ForEach-Object {
+        if ($_ -match '^\s*O\s*=(.*)$')
+        {
+            $matches[1].Trim().Trim('"')
+        }
+    })
+}
+
+function ConvertTo-NativeCommandLineArgument
+{
+    param
+    (
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyString()]
+        [String]
+        $Argument
+    )
+
+    if ($Argument -notmatch '[\s"]')
+    {
+        return $Argument
+    }
+
+    # Implement the CommandLineToArgvW round-trip algorithm: https://learn.microsoft.com/cpp/c-language/parsing-c-command-line-arguments
+    $escapedArgument = [Regex]::Replace($Argument, '(\\*)"', '$1$1\"')
+    $escapedArgument = [Regex]::Replace($escapedArgument, '(\\+)$', '$1$1')
+    return '"' + $escapedArgument + '"'
 }
 
 
@@ -1525,6 +1718,26 @@ function Test-HttpsUrl
     return $uri.IsAbsoluteUri -and $uri.Scheme -eq 'https'
 }
 
+function Test-MSDeployPublishUrl
+{
+    param
+    (
+        [Parameter(Mandatory = $true)]
+        [String]
+        $Url
+    )
+
+    $uri = $Url -as [System.Uri]
+    return $null -ne $uri -and
+        $uri.IsAbsoluteUri -and
+        $uri.Scheme -eq 'https' -and
+        $uri.Host -and
+        !$uri.UserInfo -and
+        !$uri.Query -and
+        !$uri.Fragment -and
+        $Url -notmatch '[\x00-\x1F\x7F",]'
+}
+
 
 <#
 .SYNOPSIS
@@ -1532,6 +1745,8 @@ Deploys a web package to Windows Azure.
 
 .DESCRIPTION
 The Publish-WebPackage function uses MsDeploy.exe and a web deployment package ZIP file to deploy resources to a Windows Azure web site. This function does not generate any output. If the call to MSDeploy.exe fails, the function throws an exception. To get more detailed output, use the Verbose common parameter.
+
+Run this deployment script from a dedicated, non-administrator build agent with access limited to the target application. Isolate the agent from unrelated workloads and forward deployment start, rejection, and exit-code logs to your monitoring system.
 
 .PARAMETER  WebDeployPackage
 Specifies the path and file name of a web deployment package ZIP file that Visual Studio generates. This parameter is required. To create a web deployment package ZIP file, see "How to: Create a Web Deployment Package in Visual Studio" at: http://go.microsoft.com/fwlink/?LinkId=391353.
@@ -1587,7 +1802,7 @@ function Publish-WebPackage
         $WebDeployPackage,
 
         [Parameter(Mandatory = $true)]
-        [ValidateScript({Test-HttpsUrl $_ })]
+        [ValidateScript({Test-MSDeployPublishUrl $_ })]
         [String]
         $PublishUrl,
 
@@ -1614,35 +1829,75 @@ function Publish-WebPackage
 
     Write-VerboseWithTime 'Publish-WebPackage: Start'
 
-    $msdeployCmd = Get-MSDeployCmd
+    $argumentValues = @{
+        SiteName = @{ Value = $SiteName; Pattern = '^[A-Za-z0-9][A-Za-z0-9._ -]{0,127}$' }
+        UserName = @{ Value = $UserName; Pattern = '^[A-Za-z0-9][A-Za-z0-9._@\\-]{0,255}$' }
+        Password = @{ Value = $Password; Pattern = '^[^\x00-\x1F\x7F,"]{1,1024}$' }
+    }
 
-    if (!$msdeployCmd)
+    foreach ($DBConnection in $ConnectionString.GetEnumerator())
+    {
+        if ($DBConnection.Key -notmatch '^[A-Za-z0-9][A-Za-z0-9._ -]{0,127}$')
+        {
+            throw 'Publish-WebPackage: ConnectionString name contains unsupported characters.'
+        }
+
+        if ($DBConnection.Value -notmatch '^(?!.*,\s*(?i:(?:type|scope|match|defaultValue|tags|kind|name|value))=)[^\x00-\x1F\x7F"]{1,4096}$')
+        {
+            throw 'Publish-WebPackage: ConnectionString value contains unsupported characters.'
+        }
+    }
+
+    foreach ($argumentValue in $argumentValues.GetEnumerator())
+    {
+        if ($argumentValue.Value.Value -notmatch $argumentValue.Value.Pattern)
+        {
+            throw "Publish-WebPackage: $($argumentValue.Key) contains unsupported characters."
+        }
+    }
+
+    $msdeployPath = Get-MSDeployCmd
+
+    if (!$msdeployPath)
     {
         throw 'Publish-WebPackage: MsDeploy.exe cannot be found.'
     }
 
     $WebDeployPackage = (Get-Item $WebDeployPackage).FullName
 
-    $msdeployCmd =  '"' + $msdeployCmd + '"'
-    $msdeployCmd += ' -verb:sync'
-    $msdeployCmd += ' -Source:Package="{0}"'
-    $msdeployCmd += ' -dest:auto,computername="{1}?site={2}",userName={3},password={4},authType=Basic'
+    if ($WebDeployPackage -match '[\x00-\x1F\x7F,"]')
+    {
+        throw 'Publish-WebPackage: WebDeployPackage path contains unsupported characters.'
+    }
+
+    $msdeployArguments = @(
+        '-verb:sync'
+        ('-Source:Package={0}' -f $WebDeployPackage)
+        ('-dest:auto,computername={0}?site={1},userName={2},password={3},authType=Basic' -f $PublishUrl, $SiteName, $UserName, $Password)
+    )
     if ($AllowUntrusted)
     {
-        $msdeployCmd += ' -allowUntrusted'
+        $msdeployArguments += '-allowUntrusted'
     }
-    $msdeployCmd += ' -setParam:name="IIS Web Application Name",value="{2}"'
+    $msdeployArguments += ('-setParam:name=IIS Web Application Name,value={0}' -f $SiteName)
 
     foreach ($DBConnection in $ConnectionString.GetEnumerator())
     {
-        $msdeployCmd += (' -setParam:name="{0}",value="{1}"' -f $DBConnection.Key, $DBConnection.Value)
+        $msdeployArguments += ('-setParam:name={0},value={1}' -f $DBConnection.Key, $DBConnection.Value)
     }
 
-    $msdeployCmd = $msdeployCmd -f $WebDeployPackage, $PublishUrl, $SiteName, $UserName, $Password
+    Write-VerboseWithTime ('Publish-WebPackage: Starting MsDeploy.exe for site ' + $SiteName)
 
-    Write-VerboseWithTime ('Publish-WebPackage: MsDeploy: ' + $msdeployCmd)
+    $msdeployCommandLine = ($msdeployArguments | ForEach-Object {
+        ConvertTo-NativeCommandLineArgument $_
+    }) -join ' '
 
-    $msdeployExecution = Start-Process cmd.exe -ArgumentList ('/C "' + $msdeployCmd + '" ') -WindowStyle Normal -Wait -PassThru
+    $msdeployExecution = Start-Process `
+        -FilePath $msdeployPath `
+        -ArgumentList $msdeployCommandLine `
+        -WindowStyle Normal `
+        -Wait `
+        -PassThru
 
     if ($msdeployExecution.ExitCode -ne 0)
     {
