@@ -1,6 +1,8 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Net.Http.Headers;
+using System.Security.Claims;
 using System.Threading;
 using System.Threading.Tasks;
 using Azure.Core;
@@ -18,6 +20,8 @@ namespace Company.Function
 {
     public static class TestMIHttpTrigger
     {
+        private const string RequiredRole = "AzureDevOpsWorkItemReader";
+
         public const string AdoBaseUrl = "https://dev.azure.com";
 
         public const string AdoOrgName = "Your organization name";
@@ -49,20 +53,38 @@ namespace Company.Function
 
         [FunctionName("TestMIHttpTrigger")]
         public static async Task<IActionResult> Run(
-            [HttpTrigger(AuthorizationLevel.Anonymous, "get", Route = null)] HttpRequest req,
+            [HttpTrigger(AuthorizationLevel.Function, "get", Route = null)] HttpRequest req,
             ILogger log)
         {
-            if (!int.TryParse(req.Query["workItemId"], out int workItemId))
+            if (req.HttpContext.User.Identity?.IsAuthenticated != true)
             {
-                return new BadRequestObjectResult($"Invalid Work item ID: {req.Query["workItemId"]}.");
+                log.LogWarning(
+                    "Unauthenticated request rejected. TraceId={TraceId}",
+                    req.HttpContext.TraceIdentifier);
+                return new StatusCodeResult(StatusCodes.Status401Unauthorized);
             }
 
-            var vssConnection = CreateVssConnection();
+            // EasyAuth surfaces Entra app roles as "roles"; ASP.NET inbound claim mapping can rewrite them to ClaimTypes.Role. Check both.
+            var hasRequiredRole = req.HttpContext.User.Claims.Any(
+                claim => (claim.Type == ClaimTypes.Role || claim.Type == "roles") &&
+                    claim.Value == RequiredRole);
+            if (!hasRequiredRole)
+            {
+                log.LogWarning(
+                    "Authenticated request without required role rejected. TraceId={TraceId}",
+                    req.HttpContext.TraceIdentifier);
+                return new StatusCodeResult(StatusCodes.Status403Forbidden);
+            }
 
-            var workItemTrackingHttpClient = vssConnection.GetClient<WorkItemTrackingHttpClient>();
-            
+            if (!int.TryParse(req.Query["workItemId"], out int workItemId) || workItemId <= 0)
+            {
+                return new BadRequestObjectResult("A positive work item ID is required.");
+            }
+
             try
             {
+                var vssConnection = CreateVssConnection();
+                var workItemTrackingHttpClient = vssConnection.GetClient<WorkItemTrackingHttpClient>();
                 var workItem = await workItemTrackingHttpClient.GetWorkItemAsync(workItemId);
 
                 workItem.Fields.TryGetValue("System.Title", out var title);
@@ -71,7 +93,15 @@ namespace Company.Function
             }
             catch (Exception ex)
             {
-                return new ObjectResult(ex.Message);
+                log.LogError(
+                    ex,
+                    "Failed to retrieve work item {WorkItemId}. TraceId={TraceId}",
+                    workItemId,
+                    req.HttpContext.TraceIdentifier);
+                return new ObjectResult(new { requestId = req.HttpContext.TraceIdentifier })
+                {
+                    StatusCode = StatusCodes.Status500InternalServerError
+                };
             }
         }
 
